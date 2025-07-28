@@ -343,6 +343,7 @@ impl Table {
 
     fn delete_entry(&mut self, key: u32) -> Result<TableEntry, TableError> {
         if !self.occupied(key)?.children.is_empty() {
+            eprintln!("children? {:?}", self.occupied(key)?.children);
             return Err(TableError::HasChildren);
         }
         let e = self.free_entry(key as usize);

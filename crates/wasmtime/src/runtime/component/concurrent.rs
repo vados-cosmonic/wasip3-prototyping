@@ -2376,6 +2376,7 @@ impl Instance {
         // Use the caller's `GuestTask::sync_call_set` to register interest in
         // the subtask...
         let set = state.get_mut(caller)?.sync_call_set;
+        eprintln!("\nJOIN during start_call: task [{guest_task:?}] into set [{set:?}]");
         Waitable::Guest(guest_task).join(state, Some(set))?;
 
         // ... and suspend this fiber temporarily while we wait for it to start.
@@ -2407,14 +2408,20 @@ impl Instance {
             };
 
             log::trace!("status {status:?} for {guest_task:?}");
+            eprintln!(
+                "SPINNING: status {status:?} for {guest_task:?} (async_caller? {async_caller})"
+            );
 
-            if status == Status::Returned {
+            if matches!(status, Status::Returned | Status::ReturnCancelled) {
+                // TODO: Returned or cancelled here??
                 // It returned, so we can stop waiting.
                 break (status, None);
             } else if async_caller {
                 // It hasn't returned yet, but the caller is calling via an
                 // async-lowered import, so we generate a handle for the task
                 // waitable and return the status.
+
+                // NOTE: Started was the code
                 break (
                     status,
                     Some(
@@ -2431,6 +2438,7 @@ impl Instance {
 
         let state = self.concurrent_state_mut(store.0);
 
+        eprintln!("\nJOIN during start_call (2): task [{guest_task:?}] into set [{set:?}]");
         Waitable::Guest(guest_task).join(state, None)?;
 
         if let Some(storage) = storage {
@@ -2701,6 +2709,7 @@ impl Instance {
                 state.push_future(future);
 
                 let set = state.get_mut(caller)?.sync_call_set;
+                eprintln!("\nJOIN during poll_and_block: task [{task:?}] into set [{set:?}]");
                 Waitable::Host(task).join(state, Some(set))?;
 
                 self.suspend(store, SuspendReason::Waiting { set, task: caller })?;
@@ -2782,6 +2791,7 @@ impl Instance {
 
         log::trace!("task.cancel for {guest_task:?}");
 
+        eprintln!("TASK CANCELLED?");
         self.task_complete(
             store,
             guest_task,
@@ -3065,74 +3075,117 @@ impl Instance {
 
         log::trace!("subtask_cancel {waitable:?} (handle {task_id})");
 
-        if let Waitable::Host(host_task) = waitable {
-            if let Some(handle) = concurrent_state.get_mut(host_task)?.abort_handle.take() {
-                handle.abort();
-                return Ok(Status::ReturnCancelled as u32);
+        match waitable {
+            Waitable::Host(host_task) => {
+                if let Some(handle) = concurrent_state.get_mut(host_task)?.abort_handle.take() {
+                    handle.abort();
+                    return Ok(Status::ReturnCancelled as u32);
+                }
             }
-        } else {
-            let caller = concurrent_state.guest_task.unwrap();
-            let guest_task = TableId::<GuestTask>::new(rep);
-            let task = concurrent_state.get_mut(guest_task)?;
-            if task.lower_params.is_some() {
-                task.lower_params = None;
-                task.lift_result = None;
-
-                // Not yet started; cancel and remove from pending
-                let callee_instance = task.instance;
-
-                let kind = concurrent_state
-                    .instance_state(callee_instance)
-                    .pending
-                    .remove(&guest_task);
-
-                if kind.is_none() {
-                    bail!("`subtask.cancel` called after terminal status delivered");
-                }
-
-                return Ok(Status::StartCancelled as u32);
-            } else if task.lift_result.is_some() {
-                // Started, but not yet returned or cancelled; send the
-                // `CANCELLED` event
-                task.cancel_sent = true;
-                // Note that this might overwrite an event that was set earlier
-                // (e.g. `Event::None` if the task is yielding, or
-                // `Event::Cancelled` if it was already cancelled), but that's
-                // okay -- this should supersede the previous state.
-                task.event = Some(Event::Cancelled);
-                if let Some(set) = task.wake_on_cancel.take() {
-                    let item = match concurrent_state
-                        .get_mut(set)?
-                        .waiting
-                        .remove(&guest_task)
-                        .unwrap()
-                    {
-                        WaitMode::Fiber(fiber) => WorkItem::ResumeFiber(fiber),
-                        WaitMode::Callback(instance) => WorkItem::GuestCall(GuestCall {
-                            task: guest_task,
-                            kind: GuestCallKind::DeliverEvent {
-                                instance,
-                                set: None,
-                            },
-                        }),
-                    };
-                    concurrent_state.push_high_priority(item);
-
-                    self.suspend(store, SuspendReason::Yielding { task: caller })?;
-                }
-
-                let concurrent_state = self.concurrent_state_mut(store);
+            Waitable::Transmit(..) => todo!(),
+            Waitable::Guest(..) => {
+                let caller = concurrent_state.guest_task.unwrap();
+                let guest_task = TableId::<GuestTask>::new(rep);
                 let task = concurrent_state.get_mut(guest_task)?;
-                if task.lift_result.is_some() {
-                    // Still not yet returned or cancelled; if `async_`, return
-                    // `BLOCKED`; otherwise wait
-                    if async_ {
-                        return Ok(BLOCKED);
-                    } else {
-                        let set = concurrent_state.get_mut(caller)?.sync_call_set;
-                        Waitable::Guest(guest_task).join(concurrent_state, Some(set))?;
+                if task.lower_params.is_some() {
+                    task.lower_params = None;
+                    task.lift_result = None;
 
-                        self.suspend(store, SuspendReason::Waiting { set, task: caller })?;
+                    // Not yet started; cancel and remove from pending
+                    let callee_instance = task.instance;
+
+                    let kind = concurrent_state
+                        .instance_state(callee_instance)
+                        .pending
+                        .remove(&guest_task);
+
+                    if kind.is_none() {
+                        bail!("`subtask.cancel` called after terminal status delivered");
+                    }
+
+                    return Ok(Status::StartCancelled as u32);
+                } else if task.lift_result.is_some() {
+                    // Started, but not yet returned or cancelled; send the
+                    // `CANCELLED` event
+                    task.cancel_sent = true;
+                    // Note that this might overwrite an event that was set earlier
+                    // (e.g. `Event::None` if the task is yielding, or
+                    // `Event::Cancelled` if it was already cancelled), but that's
+                    // okay -- this should supersede the previous state.
+                    task.event = Some(Event::Cancelled);
+
+                    // Remove from wake on cancel task if present
+                    if let Some(set) = task.wake_on_cancel.take() {
+                        let item = match concurrent_state
+                            .get_mut(set)?
+                            .waiting
+                            .remove(&guest_task)
+                            .unwrap()
+                        {
+                            WaitMode::Fiber(fiber) => WorkItem::ResumeFiber(fiber),
+                            WaitMode::Callback(instance) => WorkItem::GuestCall(GuestCall {
+                                task: guest_task,
+                                kind: GuestCallKind::DeliverEvent {
+                                    instance,
+                                    set: None,
+                                },
+                            }),
+                        };
+                        concurrent_state.push_high_priority(item);
+                        eprintln!("DID THE FIBER WAITING REMOVE");
+
+                        self.suspend(store, SuspendReason::Yielding { task: caller })?;
+                    }
+
+                    let concurrent_state = self.concurrent_state_mut(store);
+                    // re-retrieve the guest task
+                    let task = concurrent_state.get_mut(guest_task)?;
+                    if task.lift_result.is_some() {
+                        // Still not yet returned or cancelled; if `async_`, return
+                        // `BLOCKED`; otherwise wait
+                        if async_ {
+                            return Ok(BLOCKED);
+                        } else {
+                            // We're not in an async call, so add this call to the set of things to wait for?
+                            let set = concurrent_state.get_mut(caller)?.sync_call_set;
+                            eprintln!(
+                                "\nJOIN during subtask_cancel: task [{guest_task:?}] into set [{set:?}] (CALLER? {caller:?})"
+                            );
+
+                            // We're in subtask_cancel, so we should actually *not* join the guest_task
+                            // to the caller set that's about to be cancelled?
+
+                            // let old = concurrent_state
+                            //     .get_mut(set)?
+                            //     .waiting
+                            //     .insert(guest_task, WaitMode::Fiber(()));
+                            // // TODO: fiber?
+
+                            // TODO: this line is ending up *re-adding* a task into a set that has already
+                            // been cleared of it...?
+
+                            // FIX? By setting the event we ensure that when the subtask is cancelled,
+                            // it's marked as ready since it was cancelled?
+                            //
+                            // TODO: we don't know if it's return cancelled or not...?
+                            // Waitable::Guest(guest_task).set_event(
+                            //     concurrent_state,
+                            //     Some(Event::Subtask {
+                            //         status: Status::ReturnCancelled,
+                            //     }),
+                            // )?;
+                            // NOTE: disabled because it doesn't work?
+
+                            Waitable::Guest(guest_task).join(concurrent_state, Some(set))?;
+
+                            // // TODO: dispose() on the task *would* handle this if only the task was ready?
+                            concurrent_state
+                                .get_mut(set)?
+                                .ready
+                                .insert(Waitable::Guest(guest_task));
+
+                            self.suspend(store, SuspendReason::Waiting { set, task: caller })?;
+                        }
                     }
                 }
             }
@@ -3836,16 +3889,59 @@ impl GuestTask {
     fn dispose(self, state: &mut ConcurrentState, me: TableId<GuestTask>) -> Result<()> {
         // If there are not-yet-delivered completion events for subtasks in
         // `self.sync_call_set`, recursively dispose of those subtasks as well.
+        eprintln!(
+            "ready children? {}, waiting children? {} (SET {:?}, looking for {me:?})",
+            state.get_mut(self.sync_call_set)?.ready.len(),
+            state.get_mut(self.sync_call_set)?.waiting.len(),
+            self.sync_call_set,
+        );
         for waitable in mem::take(&mut state.get_mut(self.sync_call_set)?.ready) {
+            let waitable_rep = waitable.rep();
+            eprintln!("READY child  waitable [{waitable_rep}]");
             if let Some(Event::Subtask {
                 status: Status::Returned | Status::ReturnCancelled,
             }) = waitable.common(state)?.event
             {
+                eprintln!(
+                    "waitable [{waitable_rep}] is a subtask w/ status returned or cancelled!"
+                );
                 waitable.delete_from(state)?;
             }
         }
 
-        state.delete(self.sync_call_set)?;
+        for (task, wait_mode) in mem::take(&mut state.get_mut(self.sync_call_set)?.waiting) {
+            let waitable_rep = task.rep();
+            eprintln!(
+                "WAITING child waitable [{waitable_rep}] (wait mode {})",
+                match wait_mode {
+                    WaitMode::Fiber(_) => format!("FIBER()"),
+                    WaitMode::Callback(idx) => format!("Callback({})", idx.as_u32()),
+                }
+            );
+            // if let Some(Event::Subtask {
+            //     status: Status::Returned | Status::ReturnCancelled,
+            // }) = waitable.common(state)?.event
+            // {
+            //     eprintln!(
+            //         "waitable [{waitable_rep}] is a subtask w/ status returned or cancelled!"
+            //     );
+            //     waitable.delete_from(state)?;
+            // }
+        }
+
+        eprintln!(
+            "CALLER type? {}",
+            match &self.caller {
+                Caller::Guest { .. } => "guest",
+                Caller::Host { .. } => "host",
+            },
+        );
+
+        eprintln!("{me:?} sync_call_set? {:?}", self.sync_call_set);
+        state
+            .delete(self.sync_call_set)
+            .expect("failed to delete sync_call_set");
+        eprintln!("{me:?} deleted sync_call_set successfully!");
 
         // Reparent any pending subtasks to the caller.
         if let Caller::Guest {
@@ -3853,22 +3949,30 @@ impl GuestTask {
             instance: runtime_instance,
         } = &self.caller
         {
+            eprintln!("task {me:?} => is guest");
             let task_mut = state.get_mut(*task)?;
             let present = task_mut.subtasks.remove(&me);
             assert!(present);
 
             for subtask in &self.subtasks {
+                eprintln!("task {me:?} => inserting to parent [{}]", subtask.rep());
                 task_mut.subtasks.insert(*subtask);
             }
 
             for subtask in &self.subtasks {
+                eprintln!(
+                    "task {me:?} => converting caller to parent [{}]",
+                    subtask.rep()
+                );
                 state.get_mut(*subtask)?.caller = Caller::Guest {
                     task: *task,
                     instance: *runtime_instance,
                 };
             }
         } else {
+            eprintln!("task {me:?} => is guest");
             for subtask in &self.subtasks {
+                eprintln!("task {me:?} => removing subtask [{}]", subtask.rep());
                 state.get_mut(*subtask)?.caller = Caller::Host {
                     tx: None,
                     remove_task_automatically: true,
@@ -3961,6 +4065,18 @@ impl Waitable {
                 Waitable::Transmit(id) => state.remove_child(id, old),
             }?;
 
+            let ty = match *self {
+                Waitable::Host(id) => "host",
+                Waitable::Guest(id) => "guest",
+                Waitable::Transmit(id) => "transmit",
+            };
+
+            eprintln!(
+                "DURING JOIN for task, removing ({}) [{:?}] from old set [{old:?}]",
+                ty,
+                self.rep(),
+            );
+
             state.get_mut(old)?.ready.remove(self);
         }
 
@@ -3970,6 +4086,19 @@ impl Waitable {
                 Waitable::Guest(id) => state.add_child(id, set),
                 Waitable::Transmit(id) => state.add_child(id, set),
             }?;
+
+            let ty = match *self {
+                Waitable::Host(id) => "host",
+                Waitable::Guest(id) => "guest",
+                Waitable::Transmit(id) => "transmit",
+            };
+
+            eprintln!(
+                "DURING JOIN for task, adding ({}) [{:?}] to set [{set:?}], event is some? {}",
+                ty,
+                self.rep(),
+                self.common(state)?.event.is_some()
+            );
 
             if self.common(state)?.event.is_some() {
                 self.mark_ready(state)?;
@@ -4012,8 +4141,40 @@ impl Waitable {
     /// arrives.
     fn mark_ready(&self, state: &mut ConcurrentState) -> Result<()> {
         if let Some(set) = self.common(state)?.set {
+            eprintln!(
+                "MARKED READY, for set {set:?}, SELF = ({} rep{})",
+                match *self {
+                    Waitable::Host(table_id) => "host",
+                    Waitable::Guest(table_id) => "guest",
+                    Waitable::Transmit(table_id) => "transmit",
+                },
+                self.rep()
+            );
+            eprintln!(
+                "BEFORE INSERT ({set:?}): ready? {}, waiting? {}, ({} {})",
+                state.get_mut(set)?.ready.len(),
+                state.get_mut(set)?.waiting.len(),
+                match *self {
+                    Waitable::Host(table_id) => "host",
+                    Waitable::Guest(table_id) => "guest",
+                    Waitable::Transmit(table_id) => "transmit",
+                },
+                self.rep(),
+            );
             state.get_mut(set)?.ready.insert(*self);
+            eprintln!(
+                "AFTER INSERT ({set:?}): ready? {}, waiting? {}, ({} {})",
+                state.get_mut(set)?.ready.len(),
+                state.get_mut(set)?.waiting.len(),
+                match *self {
+                    Waitable::Host(table_id) => "host",
+                    Waitable::Guest(table_id) => "guest",
+                    Waitable::Transmit(table_id) => "transmit",
+                },
+                self.rep(),
+            );
             if let Some((task, mode)) = state.get_mut(set)?.waiting.pop_first() {
+                eprintln!("DOING POP FIRST, for set {set:?}, popped task {task:?}");
                 let wake_on_cancel = state.get_mut(task)?.wake_on_cancel.take();
                 assert!(wake_on_cancel.is_none() || wake_on_cancel == Some(set));
 
@@ -4029,6 +4190,16 @@ impl Waitable {
                 };
                 state.push_high_priority(item);
             }
+            eprintln!(
+                "AFTER POP ({set:?} for task ({} rep{})): {}",
+                match *self {
+                    Waitable::Host(table_id) => "host",
+                    Waitable::Guest(table_id) => "guest",
+                    Waitable::Transmit(table_id) => "transmit",
+                },
+                self.rep(),
+                state.get_mut(set)?.ready.len()
+            );
         }
         Ok(())
     }
@@ -4101,7 +4272,9 @@ impl Waitable {
             }
             Self::Guest(task) => {
                 log::trace!("delete guest task {task:?}");
-                state.delete(*task)?.dispose(state, *task)?;
+                let existing_task = state.delete(*task)?;
+                eprintln!("task ID? {task:?}");
+                existing_task.dispose(state, *task)?;
             }
             Self::Transmit(task) => {
                 state.delete(*task)?;

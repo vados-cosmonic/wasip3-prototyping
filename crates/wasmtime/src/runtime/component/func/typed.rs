@@ -220,7 +220,7 @@ where
 
             impl<'a, T> Drop for RemoveOnDrop<'a, T> {
                 fn drop(&mut self) {
-                    self.task.remove(self.store.as_context_mut()).unwrap();
+                    self.task.remove(self.store.as_context_mut()).expect("task remove failed");
                 }
             }
 
